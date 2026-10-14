@@ -1,0 +1,46 @@
+name: Build Turnip HostPtr (test)
+
+# Test build: one Android driver (the "regular" recipe) from a pinned Mesa commit,
+# with patches/host_ptr.patch applied. No verification, no release, no README changes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_commit:
+        description: "Full 40-hex Mesa commit to build"
+        type: string
+        default: "ea8d0ab014350ff8238647d073a2ed908cd4fbcf"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf unzip flex bison git perl python3-pip glslang-tools curl zip patch
+          pip3 install --break-system-packages meson mako
+
+      - name: Build
+        env:
+          MESA_COMMIT: ${{ inputs.mesa_commit }}
+          EXTRA_PATCH: patches/host_ptr.patch
+        run: |
+          chmod +x build_turnip.sh
+          export BUILD_VERSION="${{ github.run_number }}"
+          ./build_turnip.sh
+
+      - name: Upload driver ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 7
+          name: turnip-hostptr
+          path: turnip_workdir/mesa-turnip-*.zip
+          if-no-files-found: error
