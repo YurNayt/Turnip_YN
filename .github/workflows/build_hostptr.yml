@@ -2,6 +2,7 @@ name: Build Turnip HostPtr (test)
 
 # Test build: one Android driver (the "regular" recipe) from a pinned Mesa commit,
 # with patches/host_ptr.patch applied. No verification, no release, no README changes.
+# Extra: looks up the function that contains the crash address in the unstripped driver.
 
 on:
   workflow_dispatch:
@@ -10,6 +11,10 @@ on:
         description: "Full 40-hex Mesa commit to build"
         type: string
         default: "ea8d0ab014350ff8238647d073a2ed908cd4fbcf"
+      lookup_offset:
+        description: "Code offset inside libvulkan_freedreno.so to look up"
+        type: string
+        default: "0xa9447c"
 
 permissions:
   contents: read
@@ -36,6 +41,40 @@ jobs:
           chmod +x build_turnip.sh
           export BUILD_VERSION="${{ github.run_number }}"
           ./build_turnip.sh
+
+      - name: Inspect driver libraries (symbol lookup)
+        if: always()
+        env:
+          LOOKUP: ${{ inputs.lookup_offset }}
+        run: |
+          find turnip_workdir -name 'libvulkan_freedreno.so' -printf '%s bytes  %p\n' || true
+          find turnip_workdir -name 'libvulkan_freedreno.so' | while read -r f; do
+            echo "=== $f"
+            readelf -n "$f" | grep -i "build id" || true
+            if nm -n -C --defined-only "$f" > /tmp/syms.txt 2>/dev/null && [ -s /tmp/syms.txt ]; then
+              echo "symbols: $(wc -l < /tmp/syms.txt)"
+              python3 - <<'PY'
+          import os
+          t = int(os.environ["LOOKUP"], 16)
+          last = None
+          for l in open("/tmp/syms.txt", errors="ignore"):
+              p = l.split(None, 2)
+              if len(p) < 3:
+                  continue
+              try:
+                  a = int(p[0], 16)
+              except ValueError:
+                  continue
+              if a <= t:
+                  last = l.rstrip()
+              else:
+                  break
+          print("SYMBOL AT", hex(t), "->", last)
+          PY
+            else
+              echo "no symbol table (library is stripped)"
+            fi
+          done
 
       - name: Upload driver ZIP
         uses: actions/upload-artifact@v4
