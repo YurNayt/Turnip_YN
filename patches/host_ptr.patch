@@ -77,15 +77,16 @@ index 1d6acf2..9e3044c 100644
     }
  
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
-index 4f15084..8f2ecda 100644
+index 4f15084..4a32762 100644
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++#include <pthread.h>
 +#include <stdio.h>
  /*
   * Copyright © 2016 Red Hat.
   * Copyright © 2016 Bas Nieuwenhuizen
-@@ -341,6 +342,7 @@ get_device_extensions(const struct tu_physical_device *device,
+@@ -341,6 +343,7 @@ get_device_extensions(const struct tu_physical_device *device,
        .EXT_extended_dynamic_state2 = true,
        .EXT_extended_dynamic_state3 = true,
        .EXT_external_memory_dma_buf = true,
@@ -93,7 +94,7 @@ index 4f15084..8f2ecda 100644
        .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
        .EXT_fragment_density_map = true,
        .EXT_fragment_density_map_offset = true,
-@@ -1184,6 +1186,7 @@ static void
+@@ -1184,6 +1187,7 @@ static void
  tu_get_properties(struct tu_physical_device *pdevice,
                    struct vk_properties *props)
  {
@@ -101,7 +102,7 @@ index 4f15084..8f2ecda 100644
     /* Limits */
     props->maxImageDimension1D = (1 << 14);
     props->maxImageDimension2D = (1 << 14);
-@@ -3741,6 +3744,24 @@ tu_AllocateMemory(VkDevice _device,
+@@ -3741,6 +3745,24 @@ tu_AllocateMemory(VkDevice _device,
     const VkImportMemoryFdInfoKHR *fd_info =
        vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
  
@@ -126,7 +127,7 @@ index 4f15084..8f2ecda 100644
     const VkBufferDeviceAddressAlignmentAllocateInfoVALVE *align_info =
        vk_find_struct_const(pAllocateInfo->pNext,
                             BUFFER_DEVICE_ADDRESS_ALIGNMENT_ALLOCATE_INFO_VALVE);
-@@ -3764,6 +3785,14 @@ tu_AllocateMemory(VkDevice _device,
+@@ -3764,6 +3786,14 @@ tu_AllocateMemory(VkDevice _device,
           /* take ownership and close the fd */
           close(fd_info->fd);
        }
@@ -141,7 +142,7 @@ index 4f15084..8f2ecda 100644
     } else if (mem->vk.ahardware_buffer) {
  #if DETECT_OS_ANDROID
        const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
-@@ -4482,6 +4511,27 @@ tu_GetMemoryFdKHR(VkDevice _device,
+@@ -4482,6 +4512,27 @@ tu_GetMemoryFdKHR(VkDevice _device,
     return VK_SUCCESS;
  }
  
@@ -169,14 +170,159 @@ index 4f15084..8f2ecda 100644
  VKAPI_ATTR VkResult VKAPI_CALL
  tu_GetMemoryFdPropertiesKHR(VkDevice _device,
                              VkExternalMemoryHandleTypeFlagBits handleType,
+@@ -4721,3 +4772,74 @@ tu_SetDebugUtilsObjectNameEXT(
+ 
+    return result;
+ }
++
++#include "vk_common_entrypoints.h"
++
++/* Cache maintenance for imported host memory around submits and waits. */
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_QueueSubmit2(VkQueue queue, uint32_t submitCount,
++                const VkSubmitInfo2 *pSubmits, VkFence fence)
++{
++   tu_hostptr_sync_all();
++   return vk_common_QueueSubmit2(queue, submitCount, pSubmits, fence);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *pWaitInfo,
++                  uint64_t timeout)
++{
++   VkResult r = vk_common_WaitSemaphores(device, pWaitInfo, timeout);
++   if (r == VK_SUCCESS)
++      tu_hostptr_sync_all();
++   return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore,
++                            uint64_t *pValue)
++{
++   VkResult r = vk_common_GetSemaphoreCounterValue(device, semaphore, pValue);
++   if (r == VK_SUCCESS && tu_hostptr_any()) {
++      /* Only when this semaphore's counter moved since we last looked. */
++      static struct { uint64_t sem, value; } seen[32];
++      static unsigned next;
++      static pthread_mutex_t seen_mtx = PTHREAD_MUTEX_INITIALIZER;
++      bool moved = true;
++      pthread_mutex_lock(&seen_mtx);
++      unsigned i;
++      for (i = 0; i < 32; i++)
++         if (seen[i].sem == (uint64_t)semaphore)
++            break;
++      if (i < 32) {
++         moved = seen[i].value != *pValue;
++         seen[i].value = *pValue;
++      } else {
++         seen[next].sem = (uint64_t)semaphore;
++         seen[next].value = *pValue;
++         next = (next + 1) % 32;
++      }
++      pthread_mutex_unlock(&seen_mtx);
++      if (moved)
++         tu_hostptr_sync_all();
++   }
++   return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_WaitForFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences,
++                 VkBool32 waitAll, uint64_t timeout)
++{
++   VkResult r = vk_common_WaitForFences(device, fenceCount, pFences, waitAll, timeout);
++   if (r == VK_SUCCESS)
++      tu_hostptr_sync_all();
++   return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetFenceStatus(VkDevice device, VkFence fence)
++{
++   VkResult r = vk_common_GetFenceStatus(device, fence);
++   if (r == VK_SUCCESS)
++      tu_hostptr_sync_all();
++   return r;
++}
 diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
-index 37a9dbe..ffc8c86 100644
+index 37a9dbe..565b584 100644
 --- a/src/freedreno/vulkan/tu_knl.cc
 +++ b/src/freedreno/vulkan/tu_knl.cc
-@@ -145,6 +145,30 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+@@ -145,6 +145,102 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
     return dev->instance->knl->bo_map(dev, bo, placed_addr);
  }
  
++
++#include <pthread.h>
++
++/* Imported host memory is not IO-coherent on KGSL: maintain caches by hand. */
++#define TU_HOSTPTR_MAX 256
++static struct { void *ptr; uint64_t size; } tu_hostptr_list[TU_HOSTPTR_MAX];
++static unsigned tu_hostptr_count;
++static pthread_mutex_t tu_hostptr_mtx = PTHREAD_MUTEX_INITIALIZER;
++
++static void
++tu_hostptr_civac(void *p, uint64_t n)
++{
++#if defined(__aarch64__)
++   uint64_t ctr;
++   __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++   uint64_t line = 4ull << ((ctr >> 16) & 0xf);
++   uintptr_t a = (uintptr_t)p & ~(uintptr_t)(line - 1);
++   uintptr_t end = (uintptr_t)p + n;
++   __asm__ volatile("dsb ish" ::: "memory");
++   for (; a < end; a += line)
++      __asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
++   __asm__ volatile("dsb ish" ::: "memory");
++#else
++   (void)p; (void)n;
++#endif
++}
++
++bool
++tu_hostptr_any(void)
++{
++   return __atomic_load_n(&tu_hostptr_count, __ATOMIC_RELAXED) != 0;
++}
++
++void
++tu_hostptr_register(void *ptr, uint64_t size)
++{
++   pthread_mutex_lock(&tu_hostptr_mtx);
++   if (tu_hostptr_count < TU_HOSTPTR_MAX) {
++      tu_hostptr_list[tu_hostptr_count].ptr = ptr;
++      tu_hostptr_list[tu_hostptr_count].size = size;
++      __atomic_store_n(&tu_hostptr_count, tu_hostptr_count + 1, __ATOMIC_RELAXED);
++   }
++   pthread_mutex_unlock(&tu_hostptr_mtx);
++}
++
++void
++tu_hostptr_unregister(void *ptr)
++{
++   pthread_mutex_lock(&tu_hostptr_mtx);
++   for (unsigned i = 0; i < tu_hostptr_count; i++) {
++      if (tu_hostptr_list[i].ptr == ptr) {
++         tu_hostptr_list[i] = tu_hostptr_list[tu_hostptr_count - 1];
++         __atomic_store_n(&tu_hostptr_count, tu_hostptr_count - 1, __ATOMIC_RELAXED);
++         break;
++      }
++   }
++   pthread_mutex_unlock(&tu_hostptr_mtx);
++}
++
++void
++tu_hostptr_sync_all(void)
++{
++   if (!tu_hostptr_any())
++      return;
++   pthread_mutex_lock(&tu_hostptr_mtx);
++   for (unsigned i = 0; i < tu_hostptr_count; i++)
++      tu_hostptr_civac(tu_hostptr_list[i].ptr, tu_hostptr_list[i].size);
++   pthread_mutex_unlock(&tu_hostptr_mtx);
++}
++
 +VkResult
 +tu_bo_init_host_ptr(struct tu_device *dev,
 +                    struct tu_bo **bo,
@@ -193,6 +339,8 @@ index 37a9dbe..ffc8c86 100644
 +   if (result != VK_SUCCESS)
 +      return result;
 +
++   tu_hostptr_register(host_ptr, size);
++
 +   /* Memory comes from the app: needs flush/invalidate unless IO-coherent. */
 +   if (!dev->physical_device->has_cached_coherent_memory &&
 +       dev->physical_device->has_cached_non_coherent_memory)
@@ -205,7 +353,7 @@ index 37a9dbe..ffc8c86 100644
  tu_bo_unmap(struct tu_device *dev, struct tu_bo *bo, bool reserve)
  {
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 27f035f..dd7cb4e 100644
+index 27f035f..0a10955 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
 @@ -63,6 +63,7 @@ struct tu_bo {
@@ -226,7 +374,7 @@ index 27f035f..dd7cb4e 100644
     int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
-@@ -216,6 +220,11 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
+@@ -216,6 +220,16 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
        flags, NULL, name);
  }
  
@@ -235,11 +383,16 @@ index 27f035f..dd7cb4e 100644
 +                    void *host_ptr, uint64_t size,
 +                    enum tu_bo_alloc_flags flags);
 +
++void tu_hostptr_register(void *ptr, uint64_t size);
++void tu_hostptr_unregister(void *ptr);
++void tu_hostptr_sync_all(void);
++bool tu_hostptr_any(void);
++
  VkResult
  tu_bo_init_dmabuf(struct tu_device *dev,
                    struct tu_bo **bo,
 diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
-index 5580ed8..101ee2b 100644
+index 5580ed8..03eea5e 100644
 --- a/src/freedreno/vulkan/tu_knl_kgsl.cc
 +++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
 @@ -1,3 +1,5 @@
@@ -359,17 +512,19 @@ index 5580ed8..101ee2b 100644
  static int
  kgsl_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
  {
-@@ -497,7 +603,8 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -497,7 +603,10 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
     if (bo->map) {
        TU_RMV(bo_unmap, dev, bo);
 -      munmap(bo->map, bo->size);
 +      if (!bo->is_host_ptr)
 +         munmap(bo->map, bo->size);
++      else
++         tu_hostptr_unregister(bo->map);
     }
  
     if (bo->shared_fd != -1)
-@@ -1870,6 +1977,7 @@ static const struct tu_knl kgsl_knl_funcs = {
+@@ -1870,6 +1979,7 @@ static const struct tu_knl kgsl_knl_funcs = {
        .submitqueue_close = kgsl_submitqueue_close,
        .bo_init = kgsl_bo_init,
        .bo_init_dmabuf = kgsl_bo_init_dmabuf,
