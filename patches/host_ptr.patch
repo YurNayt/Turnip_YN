@@ -239,7 +239,7 @@ index 5580ed8..266b528 100644
        .bo_map = kgsl_bo_map,
        .bo_allow_dump = kgsl_bo_allow_dump,
 diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
-index b9a1ec9..ab956b0 100644
+index b9a1ec9..5fadd3a 100644
 --- a/src/freedreno/vulkan/tu_pipeline.cc
 +++ b/src/freedreno/vulkan/tu_pipeline.cc
 @@ -1,3 +1,5 @@
@@ -257,7 +257,7 @@ index b9a1ec9..ab956b0 100644
 +      if (!tudbg_once) {
 +         tudbg_once = true;
 +         Dl_info tudbg_di;
-+         if (dladdr((void *)&tu_CreateGraphicsPipelines, &tudbg_di))
++         if (dladdr((void *)&tudbg_once, &tudbg_di))
 +            fprintf(stderr, "TUDBG lib=%s base=%p\n",
 +                    tudbg_di.dli_fname, tudbg_di.dli_fbase);
 +      }
