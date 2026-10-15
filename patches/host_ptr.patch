@@ -238,3 +238,41 @@ index 5580ed8..266b528 100644
        .bo_export_dmabuf = kgsl_bo_export_dmabuf,
        .bo_map = kgsl_bo_map,
        .bo_allow_dump = kgsl_bo_allow_dump,
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index b9a1ec9..ab956b0 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1,3 +1,5 @@
++#include <stdio.h>
++#include <dlfcn.h>
+ /*
+  * Copyright © 2016 Red Hat.
+  * Copyright © 2016 Bas Nieuwenhuizen
+@@ -4918,6 +4920,27 @@ tu_CreateGraphicsPipelines(VkDevice device,
+                            const VkAllocationCallbacks *pAllocator,
+                            VkPipeline *pPipelines)
+ {
++   {
++      static bool tudbg_once;
++      if (!tudbg_once) {
++         tudbg_once = true;
++         Dl_info tudbg_di;
++         if (dladdr((void *)&tu_CreateGraphicsPipelines, &tudbg_di))
++            fprintf(stderr, "TUDBG lib=%s base=%p\n",
++                    tudbg_di.dli_fname, tudbg_di.dli_fbase);
++      }
++      for (uint32_t tudbg_i = 0; tudbg_i < count; tudbg_i++) {
++         fprintf(stderr, "TUDBG gfx pipeline %u: flags=0x%llx stageCount=%u stages:",
++                 tudbg_i, (unsigned long long)pCreateInfos[tudbg_i].flags,
++                 pCreateInfos[tudbg_i].stageCount);
++         for (uint32_t tudbg_s = 0;
++              pCreateInfos[tudbg_i].pStages && tudbg_s < pCreateInfos[tudbg_i].stageCount;
++              tudbg_s++)
++            fprintf(stderr, " 0x%x",
++                    (unsigned)pCreateInfos[tudbg_i].pStages[tudbg_s].stage);
++         fprintf(stderr, "\n");
++      }
++   }
+    MESA_TRACE_FUNC();
+    VkResult final_result = VK_SUCCESS;
+    uint32_t i = 0;
