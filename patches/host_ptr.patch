@@ -1,3 +1,81 @@
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index 49b4bde..ec6a7f0 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -730,6 +730,7 @@ emit_alu(struct ir3_context *ctx, nir_alu_instr *alu)
+    case nir_op_fsub:
+       dst = ir3_ADD_F_rpt(b, dst_sz, src[0], 0, src[1], IR3_REG_FNEG);
+       break;
++   case nir_op_fmadz: /* fallback, should be lowered earlier */
+    case nir_op_fmad:
+       /* The scalar ALU doesn't support mad, so expand to mul+add so that we
+        * don't unnecessarily fall back to non-earlypreamble. This is safe
+diff --git a/src/freedreno/ir3/ir3_context.c b/src/freedreno/ir3/ir3_context.c
+index 1d6acf2..9e3044c 100644
+--- a/src/freedreno/ir3/ir3_context.c
++++ b/src/freedreno/ir3/ir3_context.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "ir3_context.h"
++#include "nir_builder.h"
+ #include "ir3_compiler.h"
+ #include "ir3_image.h"
+ #include "ir3_nir.h"
+@@ -21,6 +22,45 @@ should_lower_undef(nir_undef_instr *undef)
+    return undef->def.bit_size == 1;
+ }
+ 
++
++/* Some optimization can re-create fmadz after Mesa's late lowering of
++ * fmulz/fmadz (lower_fmulz_with_abs_min) has run, and ir3 has no
++ * instruction for it ("Unhandled ALU op: fmadz"). Lower leftovers with the
++ * same formula Mesa uses: min(|a|,|b|) == 0 ? c : fmad(a, b, c).
++ */
++static bool
++ir3_lower_leftover_fmadz_instr(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_alu)
++      return false;
++
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   if (alu->op != nir_op_fmadz)
++      return false;
++
++   b->cursor = nir_before_instr(instr);
++
++   unsigned nc = alu->def.num_components;
++   nir_def *x = nir_mov_alu(b, alu->src[0], nc);
++   nir_def *y = nir_mov_alu(b, alu->src[1], nc);
++   nir_def *z = nir_mov_alu(b, alu->src[2], nc);
++
++   nir_def *is_zero =
++      nir_feq_imm(b, nir_fmin(b, nir_fabs(b, x), nir_fabs(b, y)), 0.0);
++   nir_def *res = nir_bcsel(b, is_zero, z, nir_fmad(b, x, y, z));
++
++   nir_def_rewrite_uses(&alu->def, res);
++   nir_instr_remove(instr);
++   return true;
++}
++
++static bool
++ir3_lower_leftover_fmadz(nir_shader *shader)
++{
++   return nir_shader_instructions_pass(shader, ir3_lower_leftover_fmadz_instr,
++                                       nir_metadata_none, NULL);
++}
++
+ struct ir3_context *
+ ir3_context_init(struct ir3_compiler *compiler, struct ir3_shader *shader,
+                  struct ir3_shader_variant *so)
+@@ -96,6 +136,7 @@ ir3_context_init(struct ir3_compiler *compiler, struct ir3_shader *shader,
+    /* nir_opt_algebraic() above would have unfused our ffmas, re-fuse them. */
+    if (needs_late_alg) {
+       NIR_PASS(progress, ctx->s, nir_opt_algebraic_late);
++      NIR_PASS(_, ctx->s, ir3_lower_leftover_fmadz);
+       NIR_PASS(progress, ctx->s, nir_opt_dce);
+    }
+ 
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
 index 4f15084..4b5c4ba 100644
 --- a/src/freedreno/vulkan/tu_device.cc
