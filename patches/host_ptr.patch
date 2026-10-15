@@ -77,7 +77,7 @@ index 1d6acf2..9e3044c 100644
     }
  
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
-index 4f15084..4a32762 100644
+index 4f15084..a4ca743 100644
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
 @@ -1,3 +1,5 @@
@@ -182,7 +182,7 @@ index 4f15084..4a32762 100644
 +tu_QueueSubmit2(VkQueue queue, uint32_t submitCount,
 +                const VkSubmitInfo2 *pSubmits, VkFence fence)
 +{
-+   tu_hostptr_sync_all();
++   tu_hostptr_sync_submit();
 +   return vk_common_QueueSubmit2(queue, submitCount, pSubmits, fence);
 +}
 +
@@ -246,10 +246,17 @@ index 4f15084..4a32762 100644
 +   return r;
 +}
 diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
-index 37a9dbe..565b584 100644
+index 37a9dbe..523548c 100644
 --- a/src/freedreno/vulkan/tu_knl.cc
 +++ b/src/freedreno/vulkan/tu_knl.cc
-@@ -145,6 +145,102 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+@@ -1,3 +1,6 @@
++#include <time.h>
++#include <stdlib.h>
++#include <stdio.h>
+ /*
+  * Copyright © 2016 Red Hat.
+  * Copyright © 2016 Bas Nieuwenhuizen
+@@ -145,6 +148,151 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
     return dev->instance->knl->bo_map(dev, bo, placed_addr);
  }
  
@@ -312,15 +319,64 @@ index 37a9dbe..565b584 100644
 +   pthread_mutex_unlock(&tu_hostptr_mtx);
 +}
 +
++static int
++tu_hostptr_mode(void)
++{
++   static int mode = -1;
++   if (mode < 0) {
++      const char *e = getenv("TU_HOSTPTR_SYNC");
++      mode = e ? atoi(e) : 2;
++      fprintf(stderr, "TUDBG hostptr sync mode %d\n", mode);
++   }
++   return mode;
++}
++
++static uint64_t
++tu_hostptr_now_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++static void
++tu_hostptr_sync(int min_mode)
++{
++   if (!tu_hostptr_any() || tu_hostptr_mode() < min_mode)
++      return;
++   static uint64_t calls, total_ns, window_start;
++   uint64_t t0 = tu_hostptr_now_ns();
++   pthread_mutex_lock(&tu_hostptr_mtx);
++   uint64_t bytes = 0;
++   for (unsigned i = 0; i < tu_hostptr_count; i++) {
++      tu_hostptr_civac(tu_hostptr_list[i].ptr, tu_hostptr_list[i].size);
++      bytes += tu_hostptr_list[i].size;
++   }
++   uint64_t t1 = tu_hostptr_now_ns();
++   calls++;
++   total_ns += t1 - t0;
++   if (!window_start)
++      window_start = t1;
++   if (t1 - window_start >= 5000000000ull) {
++      fprintf(stderr, "TUDBG hostptr sync: %llu calls, %.1f ms in the last 5 s, %llu MB registered\n",
++              (unsigned long long)calls, total_ns / 1e6,
++              (unsigned long long)(bytes >> 20));
++      calls = total_ns = 0;
++      window_start = t1;
++   }
++   pthread_mutex_unlock(&tu_hostptr_mtx);
++}
++
 +void
 +tu_hostptr_sync_all(void)
 +{
-+   if (!tu_hostptr_any())
-+      return;
-+   pthread_mutex_lock(&tu_hostptr_mtx);
-+   for (unsigned i = 0; i < tu_hostptr_count; i++)
-+      tu_hostptr_civac(tu_hostptr_list[i].ptr, tu_hostptr_list[i].size);
-+   pthread_mutex_unlock(&tu_hostptr_mtx);
++   tu_hostptr_sync(1);   /* after waits */
++}
++
++void
++tu_hostptr_sync_submit(void)
++{
++   tu_hostptr_sync(2);   /* before submits */
 +}
 +
 +VkResult
@@ -353,7 +409,7 @@ index 37a9dbe..565b584 100644
  tu_bo_unmap(struct tu_device *dev, struct tu_bo *bo, bool reserve)
  {
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 27f035f..0a10955 100644
+index 27f035f..6bd4603 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
 @@ -63,6 +63,7 @@ struct tu_bo {
@@ -374,7 +430,7 @@ index 27f035f..0a10955 100644
     int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
-@@ -216,6 +220,16 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
+@@ -216,6 +220,17 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
        flags, NULL, name);
  }
  
@@ -386,6 +442,7 @@ index 27f035f..0a10955 100644
 +void tu_hostptr_register(void *ptr, uint64_t size);
 +void tu_hostptr_unregister(void *ptr);
 +void tu_hostptr_sync_all(void);
++void tu_hostptr_sync_submit(void);
 +bool tu_hostptr_any(void);
 +
  VkResult
@@ -533,7 +590,7 @@ index 5580ed8..03eea5e 100644
        .bo_map = kgsl_bo_map,
        .bo_allow_dump = kgsl_bo_allow_dump,
 diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
-index b9a1ec9..5fadd3a 100644
+index b9a1ec9..2e23cde 100644
 --- a/src/freedreno/vulkan/tu_pipeline.cc
 +++ b/src/freedreno/vulkan/tu_pipeline.cc
 @@ -1,3 +1,5 @@
@@ -542,31 +599,3 @@ index b9a1ec9..5fadd3a 100644
  /*
   * Copyright © 2016 Red Hat.
   * Copyright © 2016 Bas Nieuwenhuizen
-@@ -4918,6 +4920,27 @@ tu_CreateGraphicsPipelines(VkDevice device,
-                            const VkAllocationCallbacks *pAllocator,
-                            VkPipeline *pPipelines)
- {
-+   {
-+      static bool tudbg_once;
-+      if (!tudbg_once) {
-+         tudbg_once = true;
-+         Dl_info tudbg_di;
-+         if (dladdr((void *)&tudbg_once, &tudbg_di))
-+            fprintf(stderr, "TUDBG lib=%s base=%p\n",
-+                    tudbg_di.dli_fname, tudbg_di.dli_fbase);
-+      }
-+      for (uint32_t tudbg_i = 0; tudbg_i < count; tudbg_i++) {
-+         fprintf(stderr, "TUDBG gfx pipeline %u: flags=0x%llx stageCount=%u stages:",
-+                 tudbg_i, (unsigned long long)pCreateInfos[tudbg_i].flags,
-+                 pCreateInfos[tudbg_i].stageCount);
-+         for (uint32_t tudbg_s = 0;
-+              pCreateInfos[tudbg_i].pStages && tudbg_s < pCreateInfos[tudbg_i].stageCount;
-+              tudbg_s++)
-+            fprintf(stderr, " 0x%x",
-+                    (unsigned)pCreateInfos[tudbg_i].pStages[tudbg_s].stage);
-+         fprintf(stderr, "\n");
-+      }
-+   }
-    MESA_TRACE_FUNC();
-    VkResult final_result = VK_SUCCESS;
-    uint32_t i = 0;
