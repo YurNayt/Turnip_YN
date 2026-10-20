@@ -246,7 +246,7 @@ index 4f15084..a4ca743 100644
 +   return r;
 +}
 diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
-index 37a9dbe..523548c 100644
+index 37a9dbe..9fb68a1 100644
 --- a/src/freedreno/vulkan/tu_knl.cc
 +++ b/src/freedreno/vulkan/tu_knl.cc
 @@ -1,3 +1,6 @@
@@ -256,7 +256,7 @@ index 37a9dbe..523548c 100644
  /*
   * Copyright © 2016 Red Hat.
   * Copyright © 2016 Bas Nieuwenhuizen
-@@ -145,6 +148,151 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+@@ -145,6 +148,153 @@ tu_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
     return dev->instance->knl->bo_map(dev, bo, placed_addr);
  }
  
@@ -395,12 +395,14 @@ index 37a9dbe..523548c 100644
 +   if (result != VK_SUCCESS)
 +      return result;
 +
-+   tu_hostptr_register(host_ptr, size);
++   if (!(*bo)->host_ptr_remapped) {
++      tu_hostptr_register(host_ptr, size);
 +
-+   /* Memory comes from the app: needs flush/invalidate unless IO-coherent. */
-+   if (!dev->physical_device->has_cached_coherent_memory &&
-+       dev->physical_device->has_cached_non_coherent_memory)
-+      (*bo)->cached_non_coherent = true;
++      /* Memory comes from the app: needs flush/invalidate unless IO-coherent. */
++      if (!dev->physical_device->has_cached_coherent_memory &&
++          dev->physical_device->has_cached_non_coherent_memory)
++         (*bo)->cached_non_coherent = true;
++   }
 +
 +   return VK_SUCCESS;
 +}
@@ -409,18 +411,19 @@ index 37a9dbe..523548c 100644
  tu_bo_unmap(struct tu_device *dev, struct tu_bo *bo, bool reserve)
  {
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 27f035f..6bd4603 100644
+index 27f035f..efd853c 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
-@@ -63,6 +63,7 @@ struct tu_bo {
+@@ -63,6 +63,8 @@ struct tu_bo {
     bool never_unmap : 1;
     bool cached_non_coherent : 1;
     bool lazy : 1;
-+   bool is_host_ptr : 1; /* memory owned by the app: never munmap */
++   bool is_host_ptr : 1;
++   bool host_ptr_remapped : 1; /* app VA now backed by a KGSL buffer */ /* memory owned by the app: never munmap */
  
     bool dump;
  
-@@ -143,6 +144,9 @@ struct tu_knl {
+@@ -143,6 +145,9 @@ struct tu_knl {
     VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
                                uint64_t size, uint64_t align,
                                enum tu_bo_alloc_flags flags, int prime_fd);
@@ -430,7 +433,7 @@ index 27f035f..6bd4603 100644
     int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
-@@ -216,6 +220,17 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
+@@ -216,6 +221,17 @@ tu_bo_init_new(struct tu_device *dev, struct vk_object_base *base,
        flags, NULL, name);
  }
  
@@ -449,16 +452,17 @@ index 27f035f..6bd4603 100644
  tu_bo_init_dmabuf(struct tu_device *dev,
                    struct tu_bo **bo,
 diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
-index 5580ed8..03eea5e 100644
+index 5580ed8..3691f54 100644
 --- a/src/freedreno/vulkan/tu_knl_kgsl.cc
 +++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++#include <stdlib.h>
 +#include <string.h>
 +#include <stdio.h>
  /*
   * Copyright © 2020 Google, Inc.
   * SPDX-License-Identifier: MIT
-@@ -448,6 +450,110 @@ kgsl_bo_init_dmabuf(struct tu_device *dev,
+@@ -448,6 +451,204 @@ kgsl_bo_init_dmabuf(struct tu_device *dev,
     return VK_SUCCESS;
  }
  
@@ -492,7 +496,7 @@ index 5580ed8..03eea5e 100644
 +   _IOWR(0x09, 0x36, struct tu_kgsl_gpumem_get_info)
 +
 +static VkResult
-+kgsl_bo_init_host_ptr(struct tu_device *dev,
++kgsl_bo_init_host_ptr_mapuser(struct tu_device *dev,
 +                      struct tu_bo **out_bo,
 +                      void *host_ptr,
 +                      uint64_t size,
@@ -566,10 +570,104 @@ index 5580ed8..03eea5e 100644
 +   return VK_SUCCESS;
 +}
 +
++static VkResult
++kgsl_bo_init_host_ptr_remap(struct tu_device *dev,
++                            struct tu_bo **out_bo,
++                            void *host_ptr,
++                            uint64_t size)
++{
++   int fd = dev->physical_device->local_fd;
++   bool coherent = dev->physical_device->has_cached_coherent_memory;
++
++   struct kgsl_gpuobj_alloc req = {
++      .size = size,
++      .flags = coherent
++         ? (KGSL_MEMFLAGS_IOCOHERENT |
++            (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT))
++         : (uint64_t)(KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT),
++   };
++   if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req)) {
++      fprintf(stderr, "TUDBG hostptr remap: GPUOBJ_ALLOC failed errno=%d\n", errno);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   auto free_obj = [&]() {
++      struct kgsl_gpumem_free_id free_req = { .id = req.id };
++      safe_ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &free_req);
++   };
++
++   struct kgsl_gpuobj_info info_req = { .id = req.id };
++   if (safe_ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info_req)) {
++      fprintf(stderr, "TUDBG hostptr remap: GPUOBJ_INFO failed errno=%d\n", errno);
++      free_obj();
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   off_t offset = (off_t)req.id << 12;
++   void *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
++   if (tmp == MAP_FAILED) {
++      fprintf(stderr, "TUDBG hostptr remap: temp mmap failed errno=%d\n", errno);
++      free_obj();
++      return VK_ERROR_MEMORY_MAP_FAILED;
++   }
++   memcpy(tmp, host_ptr, size);   /* keep what the app already wrote */
++   void *fixed = mmap(host_ptr, size, PROT_READ | PROT_WRITE,
++                      MAP_SHARED | MAP_FIXED, fd, offset);
++   munmap(tmp, size);
++   if (fixed != host_ptr) {
++      /* host_ptr pages may already be gone if MAP_FIXED half-failed; this is
++       * fatal for the app either way, but report it clearly. */
++      fprintf(stderr, "TUDBG hostptr remap: MAP_FIXED at %p failed errno=%d\n", host_ptr, errno);
++      free_obj();
++      return VK_ERROR_MEMORY_MAP_FAILED;
++   }
++
++   fprintf(stderr, "TUDBG hostptr remap OK va=%p size=0x%llx gpu=0x%llx id=%u flags=0x%llx (%s)\n",
++           host_ptr, (unsigned long long)size, (unsigned long long)info_req.gpuaddr,
++           req.id, (unsigned long long)info_req.flags,
++           coherent ? "io-coherent" : "uncached");
++
++   struct tu_bo *bo = tu_device_lookup_bo(dev, req.id);
++   assert(bo && bo->gem_handle == 0);
++
++   *bo = (struct tu_bo) {
++      .gem_handle = req.id,
++      .size = size,
++      .iova = info_req.gpuaddr,
++      .name = tu_debug_bos_add(dev, size, "host_ptr_remap"),
++      .refcnt = 1,
++      .shared_fd = -1,
++   };
++   bo->map = host_ptr;
++   bo->is_host_ptr = true;        /* never munmap: the app owns this address */
++   bo->host_ptr_remapped = true;
++   bo->never_unmap = true;
++   bo->unique_id = req.id;
++
++   tu_dump_bo_init(dev, bo);
++   *out_bo = bo;
++   return VK_SUCCESS;
++}
++
++static VkResult
++kgsl_bo_init_host_ptr(struct tu_device *dev,
++                      struct tu_bo **out_bo,
++                      void *host_ptr,
++                      uint64_t size,
++                      enum tu_bo_alloc_flags flags)
++{
++   const char *e = getenv("TU_HOSTPTR_REMAP");
++   if (!e || atoi(e) != 0) {
++      if (kgsl_bo_init_host_ptr_remap(dev, out_bo, host_ptr, size) == VK_SUCCESS)
++         return VK_SUCCESS;
++      fprintf(stderr, "TUDBG hostptr remap failed, falling back to MAP_USER_MEM\n");
++   }
++   return kgsl_bo_init_host_ptr_mapuser(dev, out_bo, host_ptr, size, flags);
++}
++
  static int
  kgsl_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
  {
-@@ -497,7 +603,10 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -497,7 +698,10 @@ kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
     if (bo->map) {
        TU_RMV(bo_unmap, dev, bo);
@@ -581,7 +679,7 @@ index 5580ed8..03eea5e 100644
     }
  
     if (bo->shared_fd != -1)
-@@ -1870,6 +1979,7 @@ static const struct tu_knl kgsl_knl_funcs = {
+@@ -1870,6 +2074,7 @@ static const struct tu_knl kgsl_knl_funcs = {
        .submitqueue_close = kgsl_submitqueue_close,
        .bo_init = kgsl_bo_init,
        .bo_init_dmabuf = kgsl_bo_init_dmabuf,
